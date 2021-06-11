@@ -20,13 +20,27 @@ import sys
 import cv2
 import argparse
 from PIL import Image
+DATA_DIR = '/home/aiot/data'
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(BASE_DIR)
 sys.path.append(os.path.join(BASE_DIR, '../utils/'))
 import pc_util
 import sunrgbd_utils
 
-DEFAULT_TYPE_WHITELIST = ['bed','table','sofa','chair','toilet','desk','dresser','night_stand','bookshelf','bathtub']
+
+############## For image segmentation
+import torch
+import torchvision
+import torchvision.transforms as T
+
+# import some common libraries
+import random
+
+
+#DEFAULT_TYPE_WHITELIST = ['bed','table','sofa','chair','toilet','desk','dresser','night_stand','bookshelf','bathtub']
+DEFAULT_TYPE_WHITELIST = ['bed','table','sofa','chair','toilet','desk','dresser','night_stand','bookshelf','bathtub','person']
+
+COCO2SUNRGBD = {62:3, 63:2, 65:0, 67:1, 70:4, 1:10}
 
 class sunrgbd_object(object):
     ''' Load and parse object data '''
@@ -191,13 +205,35 @@ def extract_sunrgbd_data(idx_filename, split, output_folder, num_point=20000,
             then three sets of GT votes for up to three objects. If the point is only in one
             object's OBB, then the three GT votes are the same.
     """
-    dataset = sunrgbd_object('./sunrgbd_trainval', split, use_v1=use_v1)
+    dataset = sunrgbd_object('/home/aiot/data/sunrgbd_trainval', split, use_v1=use_v1)
     data_idx_list = [int(line.rstrip()) for line in open(idx_filename)]
+
+    output_folder = os.path.join(os.path.dirname(os.path.dirname(BASE_DIR)), output_folder)
+    print(output_folder)
+
 
     if not os.path.exists(output_folder):
         os.mkdir(output_folder)
+        
+    data_idx_list = range(20000,20053)
+    #data_idx_list = [20007,20008,20009]
+
+    
+
+    imgSegModel = torchvision.models.detection.maskrcnn_resnet50_fpn(pretrained=True)
+    imgSegModel.eval()
+    device = torch.device("cuda:3" if torch.cuda.is_available() else "cpu")
+    imgSegModel.to(device)
+
+    threshold = 0.9
+    num_sunrgbd_class = len(DEFAULT_TYPE_WHITELIST)
 
     for data_idx in data_idx_list:
+        # This is for selective data generation
+        if data_idx % 5 != 0:
+            continue    
+        #if data_idx <= 2983:
+        #    continue
         print('------------- ', data_idx)
         objects = dataset.get_label_objects(data_idx)
 
@@ -225,10 +261,70 @@ def extract_sunrgbd_data(idx_filename, split, output_folder, num_point=20000,
         pc_upright_depth = dataset.get_depth(data_idx)
         pc_upright_depth_subsampled = pc_util.random_sampling(pc_upright_depth, num_point)
 
+        ########## Add 2D segmentation result to point cloud(Point Painting) ##########
+        # Project points to image
+        calib = dataset.get_calibration(data_idx)
+        uv,d = calib.project_upright_depth_to_image(pc_upright_depth_subsampled[:,0:3])        
+        
+        # Run image segmentation result and get result
+        img = dataset.get_image(data_idx)        
+        transform = T.Compose([T.ToTensor()])
+        img_tensor = transform(img).to(device)        
+        
+        # Img segmentation model inference
+        pred = imgSegModel([img_tensor])
+
+        pred_score = list(pred[0]['scores'].detach().cpu().numpy())        
+        masks = (pred[0]['masks']>0.5).squeeze().detach().cpu().numpy()            
+        if len(masks.shape) < 3:
+            masks = np.expand_dims(masks, axis = 0)
+        pred_score_thr = [pred_score.index(x) for x in pred_score if x > threshold]
+        mask_expand = np.zeros((masks.shape[1], masks.shape[2], num_sunrgbd_class)) # h, w, num_class 
+
+        if len(pred_score_thr) > 0:        
+            pred_t = [pred_score.index(x) for x in pred_score if x > threshold][-1]            
+            masks = masks[:(pred_t+1)]            
+            
+            # Segmentation score to each pixel in one hot form
+            for i in range(pred_t+1):
+                each_class = pred[0]['labels'][i].item()
+                if each_class not in COCO2SUNRGBD:
+                    #print("Not found", each_class)
+                    continue
+                new_class = COCO2SUNRGBD[each_class]               
+                mask_expand += np.tile(np.expand_dims(masks[i] * pred_score[i], axis=-1), (1,1,num_sunrgbd_class)) \
+                                * np.eye(num_sunrgbd_class)[new_class]  # (h, w, num_class)        
+        
+        h, w, _ = img.shape        
+
+        pc_shape = pc_upright_depth_subsampled.shape #(N, 3 + features)
+        painted_shape = list(pc_shape).extend([num_sunrgbd_class]) #(N, 3 + features + image seg classification)
+        painted = np.zeros(painted_shape)                
+
+        # Find the mapping from image to point cloud
+        uv[:,0] = uv[:,0] / img.shape[1] * w
+        uv[:,1] = uv[:,1] / img.shape[0] * h
+
+        uv[:,0] = np.minimum(w-1, uv[:,0])
+        uv[:,1] = np.minimum(h-1, uv[:,1])
+
+        # Append segmentation score to each point
+        painted = np.concatenate([pc_upright_depth_subsampled[:,:3],\
+                                mask_expand[uv[:,1].astype(np.int), uv[:,0].astype(np.int)]], axis=-1)
+        np.savez_compressed(os.path.join(output_folder, '%06d_pc_painted.npz'%(data_idx)), pc=painted) 
+
+        #print("Painted shape", painted.shape)       
+        
+        # To check point painting works well
+        #pc_util.write_ply_rgb(painted[:,0:3],
+        #        (painted[:,11:14]*256).astype(np.int),os.path.join('/home/gundo0102', 'painted_person_20050.obj'))
+
+        #break
+
         np.savez_compressed(os.path.join(output_folder,'%06d_pc.npz'%(data_idx)),
             pc=pc_upright_depth_subsampled)
         np.save(os.path.join(output_folder, '%06d_bbox.npy'%(data_idx)), obbs)
-       
+        
         if save_votes:
             N = pc_upright_depth_subsampled.shape[0]
             point_votes = np.zeros((N,10)) # 3 votes and 1 vote mask 
@@ -259,7 +355,7 @@ def extract_sunrgbd_data(idx_filename, split, output_folder, num_point=20000,
                     print('ERROR ----',  data_idx, obj.classname)
             np.savez_compressed(os.path.join(output_folder, '%06d_votes.npz'%(data_idx)),
                 point_votes = point_votes)
-
+        
     
 def get_box3d_dim_statistics(idx_filename,
     type_whitelist=DEFAULT_TYPE_WHITELIST,
@@ -312,21 +408,23 @@ if __name__=='__main__':
     args = parser.parse_args()
 
     if args.viz:
-        data_viz(os.path.join(BASE_DIR, 'sunrgbd_trainval'))
+        data_viz(os.path.join(DATA_DIR, 'sunrgbd_trainval'))
         exit()
 
     if args.compute_median_size:
-        get_box3d_dim_statistics(os.path.join(BASE_DIR, 'sunrgbd_trainval/train_data_idx.txt'))
+        get_box3d_dim_statistics(os.path.join(DATA_DIR, 'sunrgbd_trainval/train_data_idx.txt'))
         exit()
 
     if args.gen_v1_data:
-        extract_sunrgbd_data(os.path.join(BASE_DIR, 'sunrgbd_trainval/train_data_idx.txt'),
+        #extract_sunrgbd_data(os.path.join(DATA_DIR, 'sunrgbd_trainval/train_data_idx.txt'),
+        #    split = 'training',            
+        #    output_folder = os.path.join(os.path.dirname(os.path.dirname(BASE_DIR)), 'sunrgbd_pc_bbox_votes_50k_v1_train_person_added'),
+        #    #output_folder = os.path.join(os.path.dirname(os.path.dirname(BASE_DIR)), 'sunrgbd_pc_bbox_votes_50k_v1_train'),
+        #    save_votes=True, num_point=50000, use_v1=True, skip_empty_scene=False)
+        extract_sunrgbd_data(os.path.join(DATA_DIR, 'sunrgbd_trainval/val_data_idx.txt'),
             split = 'training',
-            output_folder = os.path.join(BASE_DIR, 'sunrgbd_pc_bbox_votes_50k_v1_train'),
-            save_votes=True, num_point=50000, use_v1=True, skip_empty_scene=False)
-        extract_sunrgbd_data(os.path.join(BASE_DIR, 'sunrgbd_trainval/val_data_idx.txt'),
-            split = 'training',
-            output_folder = os.path.join(BASE_DIR, 'sunrgbd_pc_bbox_votes_50k_v1_val'),
+            output_folder = os.path.join(os.path.dirname(os.path.dirname(BASE_DIR)), 'sunrgbd_pc_bbox_votes_50k_v1_val_person_added'),
+            #output_folder = os.path.join(os.path.dirname(os.path.dirname(BASE_DIR)), 'sunrgbd_pc_bbox_votes_50k_v1_val'),
             save_votes=True, num_point=50000, use_v1=True, skip_empty_scene=False)
     
     if args.gen_v2_data:

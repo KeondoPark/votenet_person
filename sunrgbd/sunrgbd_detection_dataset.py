@@ -27,6 +27,7 @@ from torch.utils.data import Dataset
 import scipy.io as sio # to load .mat files for depth points
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(BASE_DIR)
+DATA_DIR = os.path.dirname(os.path.dirname(BASE_DIR))
 sys.path.append(BASE_DIR)
 sys.path.append(os.path.join(ROOT_DIR, 'utils'))
 import pc_util
@@ -40,28 +41,37 @@ MEAN_COLOR_RGB = np.array([0.5,0.5,0.5]) # sunrgbd color is in 0~1
 class SunrgbdDetectionVotesDataset(Dataset):
     def __init__(self, split_set='train', num_points=20000,
         use_color=False, use_height=False, use_v1=False,
-        augment=False, scan_idx_list=None):
+        augment=False, scan_idx_list=None, use_painted=False):
 
         assert(num_points<=50000)
         self.use_v1 = use_v1 
         if use_v1:
-            self.data_path = os.path.join(ROOT_DIR,
-                'sunrgbd/sunrgbd_pc_bbox_votes_50k_v1_%s'%(split_set))
+            #self.data_path = os.path.join(DATA_DIR,
+            #    'sunrgbd_pc_bbox_votes_50k_v1_%s'%(split_set))
+            self.data_path = os.path.join(DATA_DIR,
+                'sunrgbd_pc_bbox_votes_50k_v1_%s_person_added'%(split_set))
         else:
-            self.data_path = os.path.join(ROOT_DIR,
-                'sunrgbd/sunrgbd_pc_bbox_votes_50k_v2_%s'%(split_set))
+            #self.data_path = os.path.join(ROOT_DIR,
+            #    'sunrgbd/sunrgbd_pc_bbox_votes_50k_v2_%s'%(split_set))
+            self.data_path = os.path.join(DATA_DIR,
+                'sunrgbd_pc_bbox_votes_50k_v2_%s'%(split_set))
+
 
         self.raw_data_path = os.path.join(ROOT_DIR, 'sunrgbd/sunrgbd_trainval')
         self.scan_names = sorted(list(set([os.path.basename(x)[0:6] \
             for x in os.listdir(self.data_path)])))
         if scan_idx_list is not None:
-            self.scan_names = [self.scan_names[i] for i in scan_idx_list]
+            self.scan_names = [self.scan_names[i] for i in scan_idx_list]            
         self.num_points = num_points
         self.augment = augment
         self.use_color = use_color
         self.use_height = use_height
+        self.use_painted = use_painted
+        self.n_class = len(DC.class2type)
+        print(self.scan_names)
        
     def __len__(self):
+
         return len(self.scan_names)
 
     def __getitem__(self, idx):
@@ -83,12 +93,20 @@ class SunrgbdDetectionVotesDataset(Dataset):
             max_gt_bboxes: unused
         """
         scan_name = self.scan_names[idx]
-        point_cloud = np.load(os.path.join(self.data_path, scan_name)+'_pc.npz')['pc'] # Nx6
+        #point_cloud = np.load(os.path.join(self.data_path, scan_name)+'_pc.npz')['pc'] # Nx6
         bboxes = np.load(os.path.join(self.data_path, scan_name)+'_bbox.npy') # K,8
         point_votes = np.load(os.path.join(self.data_path, scan_name)+'_votes.npz')['point_votes'] # Nx10
 
-        if not self.use_color:
-            point_cloud = point_cloud[:,0:3]
+        # Use painted point cloud
+        if self.use_painted:
+            point_cloud = np.load(os.path.join(self.data_path, scan_name)+'_pc_painted.npz')['pc']
+
+            if not self.use_color:                
+                point_cloud = np.concatenate([point_cloud[:,:3], point_cloud[:,-self.n_class:]], axis=-1)
+
+        elif not self.use_color:
+            point_cloud = point_cloud[:,0:3]       
+        
         else:
             point_cloud = point_cloud[:,0:6]
             point_cloud[:,3:] = (point_cloud[:,3:]-MEAN_COLOR_RGB)
@@ -208,6 +226,7 @@ class SunrgbdDetectionVotesDataset(Dataset):
         ret_dict['vote_label_mask'] = point_votes_mask.astype(np.int64)
         ret_dict['scan_idx'] = np.array(idx).astype(np.int64)
         ret_dict['max_gt_bboxes'] = max_bboxes
+        ret_dict['box3d_sizes'] = box3d_sizes
         return ret_dict
 
 def viz_votes(pc, point_votes, point_votes_mask):
@@ -251,23 +270,40 @@ def viz_obb(pc, label, mask, angle_classes, angle_residuals,
     pc_util.write_ply(label[mask==1,:], 'gt_centroids.ply')
 
 def get_sem_cls_statistics():
-    """ Compute number of objects for each semantic class """
-    d = SunrgbdDetectionVotesDataset(use_height=True, use_color=True, use_v1=True, augment=True)
+    """ Compute number of objects for each semantic class /  Average size of objects for each semantic class """
+    d = SunrgbdDetectionVotesDataset(use_height=True, use_color=False, use_v1=True, augment=False)
+    #type2class={'bed':0, 'table':1, 'sofa':2, 'chair':3, 'toilet':4, 'desk':5, 'dresser':6, 'night_stand':7, 'bookshelf':8, 'bathtub':9,'person':10}
+    type2class={'bed':0, 'table':1, 'sofa':2, 'chair':3, 'toilet':4, 'desk':5, 'dresser':6, 'night_stand':7, 'bookshelf':8, 'bathtub':9}
+    class2type = {type2class[t]:t for t in type2class}
     sem_cls_cnt = {}
+    sem_cls_sizes = {}
     for i in range(len(d)):
         if i%10==0: print(i)
         sample = d[i]
         pc = sample['point_clouds']
-        sem_cls = sample['sem_cls_label']
+        sem_cls = sample['sem_cls_label']        
         mask = sample['box_label_mask']
-        for j in sem_cls:
+
+        size = sample['box3d_sizes']        
+
+        for j in range(len(sem_cls)):
             if mask[j] == 0: continue
-            if sem_cls[j] not in sem_cls_cnt:
-                sem_cls_cnt[sem_cls[j]] = 0
-            sem_cls_cnt[sem_cls[j]] += 1
+            if class2type[sem_cls[j]] not in sem_cls_cnt:
+                sem_cls_cnt[class2type[sem_cls[j]]] = 0
+            if class2type[sem_cls[j]] not in sem_cls_sizes:
+                sem_cls_sizes[class2type[sem_cls[j]]] = [0,0,0]                
+            sem_cls_cnt[class2type[sem_cls[j]]] += 1
+            
+            sem_cls_sizes[class2type[sem_cls[j]]] = [sum(x) for x in zip(sem_cls_sizes[class2type[sem_cls[j]]], size[j])]
+            
+    for key in sem_cls_sizes.keys():
+        n = sem_cls_cnt[key]
+        sem_cls_sizes[key] = [x / n for x in  sem_cls_sizes[key]]
     print(sem_cls_cnt)
+    print(sem_cls_sizes)
 
 if __name__=='__main__':
+    '''
     d = SunrgbdDetectionVotesDataset(use_height=True, use_color=True, use_v1=True, augment=True)
     sample = d[200]
     print(sample['vote_label'].shape, sample['vote_label_mask'].shape)
@@ -276,3 +312,9 @@ if __name__=='__main__':
     viz_obb(sample['point_clouds'], sample['center_label'], sample['box_label_mask'],
         sample['heading_class_label'], sample['heading_residual_label'],
         sample['size_class_label'], sample['size_residual_label'])
+    '''
+    #get_sem_cls_statistics()
+
+    d = SunrgbdDetectionVotesDataset(use_height=True, split_set='val', use_color=False, use_v1=True, augment=True, use_painted=True)
+    sample = d[4]
+    print(sample['point_clouds'].shape)

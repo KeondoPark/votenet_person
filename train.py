@@ -63,6 +63,7 @@ parser.add_argument('--use_color', action='store_true', help='Use RGB color in i
 parser.add_argument('--use_sunrgbd_v2', action='store_true', help='Use V2 box labels for SUN RGB-D dataset')
 parser.add_argument('--overwrite', action='store_true', help='Overwrite existing log and dump folders.')
 parser.add_argument('--dump_results', action='store_true', help='Dump results.')
+parser.add_argument('--use_painted', action='store_true', help='Use Point painting')
 FLAGS = parser.parse_args()
 
 # ------------------------------------------------------------------------- GLOBAL CONFIG BEG
@@ -118,11 +119,13 @@ if FLAGS.dataset == 'sunrgbd':
     TRAIN_DATASET = SunrgbdDetectionVotesDataset('train', num_points=NUM_POINT,
         augment=True,
         use_color=FLAGS.use_color, use_height=(not FLAGS.no_height),
-        use_v1=(not FLAGS.use_sunrgbd_v2))
+        use_v1=(not FLAGS.use_sunrgbd_v2),
+        use_painted=FLAGS.use_painted)
     TEST_DATASET = SunrgbdDetectionVotesDataset('val', num_points=NUM_POINT,
         augment=False,
         use_color=FLAGS.use_color, use_height=(not FLAGS.no_height),
-        use_v1=(not FLAGS.use_sunrgbd_v2))
+        use_v1=(not FLAGS.use_sunrgbd_v2),
+        use_painted=FLAGS.use_painted)
 elif FLAGS.dataset == 'scannet':
     sys.path.append(os.path.join(ROOT_DIR, 'scannet'))
     from scannet_detection_dataset import ScannetDetectionDataset, MAX_NUM_OBJ
@@ -148,6 +151,11 @@ print(len(TRAIN_DATALOADER), len(TEST_DATALOADER))
 MODEL = importlib.import_module(FLAGS.model) # import network module
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 num_input_channel = int(FLAGS.use_color)*3 + int(not FLAGS.no_height)*1
+
+### Point Paiting : Sementation score is appended at the end of point cloud
+if FLAGS.use_painted:
+    num_input_channel += DATASET_CONFIG.num_class
+
 
 if FLAGS.model == 'boxnet':
     Detector = MODEL.BoxNet
